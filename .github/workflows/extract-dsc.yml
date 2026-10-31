@@ -50,23 +50,26 @@ jobs:
       - name: 安装 ipsw (macOS arm64)
         run: |
           set -eux
-          curl -fL --retry 3 -o /tmp/ipsw.tar.gz \
+          mkdir -p "$RUNNER_TEMP/ipswbin"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/ipsw.tar.gz" \
             "https://github.com/blacktop/ipsw/releases/download/v${IPSW_VER}/ipsw_${IPSW_VER}_macOS_arm64.tar.gz"
-          tar xzf /tmp/ipsw.tar.gz -C /tmp
-          find /tmp -maxdepth 2 -name 'ipsw' -type f -perm +111 | head
-          sudo install -m 0755 "$(find /tmp -maxdepth 2 -name 'ipsw' -type f -perm +111 | head -1)" /usr/local/bin/ipsw
-          ipsw version
+          tar xzf "$RUNNER_TEMP/ipsw.tar.gz" -C "$RUNNER_TEMP/ipswbin"
+          # tarball 根目录就是 ipsw 二进制（-rwxr-xr-x, 86 MB）
+          ls -l "$RUNNER_TEMP/ipswbin/ipsw"
+          chmod +x "$RUNNER_TEMP/ipswbin/ipsw"
+          sudo install -m 0755 "$RUNNER_TEMP/ipswbin/ipsw" /usr/local/bin/ipsw
+          /usr/local/bin/ipsw version
 
       - name: 下载 OTA (Apple CDN)
         run: |
           set -eux
           curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/ota.zip" "$OTA_URL"
-          ls -l "$RUNNER_TEMP/ota.zip"
           ACTUAL=$(stat -f %z "$RUNNER_TEMP/ota.zip")
           echo "actual_size=$ACTUAL expected=$OTA_SIZE"
-          # size 来自 appledb，允许 zip 头差异
+          ls -lh "$RUNNER_TEMP/ota.zip"
+          df -h /
           if [ "$ACTUAL" -lt $((OTA_SIZE - 100000)) ]; then
-            echo "::error::OTA size mismatch"
+            echo "::error::OTA size mismatch ($ACTUAL < $OTA_SIZE)"
             exit 1
           fi
 
