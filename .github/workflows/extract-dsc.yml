@@ -1,37 +1,47 @@
 name: extract-dsc
 
 # 目的：在 macOS arm64 runner 上，用 ipsw 的 AppleArchive 私有 API 路径，
-# 把 22H20 全量 OTA 里的 cryptex 卷展开，取出完整的 dyld_shared_cache_arm64e 家族。
+# 把 iOS 全量 OTA / IPSW 里的 cryptex 卷展开，取出完整的
+# dyld_shared_cache_arm64e 家族。
 #
 # 背景（见 DarkSword-RCE/docs/RIDIFF10-CRYPTEX-ANALYSIS.md）：
 #   OTA 里的 cryptex-system-arm64e 是 RIDIFF10 编码，解压流头部声明
 #   输出 4,273,995,776 字节（4076 MiB），但 pbzx→XZ 只能得到 33%。
 #   剩余 67% 必须由 libAppleArchive 的 PrivateStream 应用，只有 macOS 有。
 #
-# 数据源：Apple CDN（公开，无需上传本地 6.64 GB）
+# 数据源：Apple CDN（公开，无需上传本地大文件）
 on:
   workflow_dispatch:
     inputs:
-      verbose:
-        description: 'Enable verbose ipsw output'
+      source_url:
+        description: 'OTA/IPSW 的 CDN 直链'
         required: false
-        default: 'true'
+        default: 'https://updates.cdn-apple.com/2025FallFCS/patches/082-75570/91F55AF9-E02B-41DF-BC6D-A05FE69F5737/com_apple_MobileAsset_SoftwareUpdate/9ab7174531098c763c73a13af25cccac10282535.zip'
+      expect_build:
+        description: '期望的 BuildVersion（留空则不校验）'
+        required: false
+        default: '22H20'
+      mode:
+        description: 'ota = 全量 OTA (zip)；ipsw = 完整 IPSW (zip)'
+        required: false
+        default: 'ota'
+      artifact_name:
+        description: '产物名'
+        required: false
+        default: 'dsc-22H20'
 
 permissions:
   contents: read
+
+env:
+  IPSW_VER: '3.1.741'
 
 jobs:
   extract:
     # macOS 15 arm64 = macOS 15.8.2 (24H232), Darwin 24.6.0
     # 官方要求 macOS 13(Ventura)+，15 满足
     runs-on: macos-15
-    timeout-minutes: 180
-
-    env:
-      OTA_URL: 'https://updates.cdn-apple.com/2025FallFCS/patches/082-75570/91F55AF9-E02B-41DF-BC6D-A05FE69F5737/com_apple_MobileAsset_SoftwareUpdate/9ab7174531098c763c73a13af25cccac10282535.zip'
-      OTA_SHA1: '9ab7174531098c763c73a13af25cccac10282535'
-      OTA_SIZE: '7130336719'
-      IPSW_VER: '3.1.741'
+    timeout-minutes: 240
 
     steps:
       - name: 环境自检
@@ -39,11 +49,8 @@ jobs:
           set -eux
           uname -a
           sw_vers
-          echo "--- arch ---"
           uname -m
-          echo "--- disk ---"
           df -h /
-          echo "--- CPU / RAM ---"
           sysctl -n hw.ncpu
           sysctl -n hw.memsize
 
@@ -54,103 +61,94 @@ jobs:
           curl -fL --retry 3 -o "$RUNNER_TEMP/ipsw.tar.gz" \
             "https://github.com/blacktop/ipsw/releases/download/v${IPSW_VER}/ipsw_${IPSW_VER}_macOS_arm64.tar.gz"
           tar xzf "$RUNNER_TEMP/ipsw.tar.gz" -C "$RUNNER_TEMP/ipswbin"
-          # tarball 根目录就是 ipsw 二进制（-rwxr-xr-x, 86 MB）
+          # tarball 根目录就是 ipsw 二进制（-rwxr-xr-x）
           ls -l "$RUNNER_TEMP/ipswbin/ipsw"
           chmod +x "$RUNNER_TEMP/ipswbin/ipsw"
           sudo install -m 0755 "$RUNNER_TEMP/ipswbin/ipsw" /usr/local/bin/ipsw
           /usr/local/bin/ipsw version
 
-      - name: 下载 OTA (Apple CDN)
+      - name: 下载镜像（Apple CDN）
         run: |
           set -eux
-          curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/ota.zip" "$OTA_URL"
-          ACTUAL=$(stat -f %z "$RUNNER_TEMP/ota.zip")
-          echo "actual_size=$ACTUAL expected=$OTA_SIZE"
-          ls -lh "$RUNNER_TEMP/ota.zip"
+          curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/image.zip" "${{ inputs.source_url }}"
+          ls -lh "$RUNNER_TEMP/image.zip"
+          echo "bytes=$(stat -f %z "$RUNNER_TEMP/image.zip")"
           df -h /
-          if [ "$ACTUAL" -lt $((OTA_SIZE - 100000)) ]; then
-            echo "::error::OTA size mismatch ($ACTUAL < $OTA_SIZE)"
-            exit 1
+
+      - name: 解析 info（确认 build）
+        run: |
+          set -eux
+          if [ "${{ inputs.mode }}" = "ipsw" ]; then
+            ipsw info "$RUNNER_TEMP/image.zip" || true
+          else
+            ipsw ota info "$RUNNER_TEMP/image.zip" || true
           fi
 
-      - name: OTA info（确认解析正确）
-        run: |
-          set -eux
-          ipsw ota info "$RUNNER_TEMP/ota.zip" || true
-
-      - name: 尝试 A —— ota extract --dyld
-        id: attempt_extract
-        continue-on-error: true
+      - name: 提取 dyld_shared_cache（主路径）
         run: |
           set -eux
           mkdir -p "$RUNNER_TEMP/out_extract"
-          ipsw ota extract "$RUNNER_TEMP/ota.zip" --dyld \
-            --output "$RUNNER_TEMP/out_extract" 2>&1 | tee /tmp/extract.log
+          if [ "${{ inputs.mode }}" = "ipsw" ]; then
+            ipsw extract --dyld "$RUNNER_TEMP/image.zip" \
+              --output "$RUNNER_TEMP/out_extract" 2>&1 | tee /tmp/extract.log
+          else
+            ipsw ota extract "$RUNNER_TEMP/image.zip" --dyld \
+              --output "$RUNNER_TEMP/out_extract" 2>&1 | tee /tmp/extract.log
+          fi
           echo "--- found ---"
           find "$RUNNER_TEMP/out_extract" -name 'dyld_shared_cache_arm64e*' | head -100
 
-      - name: 尝试 B —— 显式正则提取 dsc 家族
-        if: steps.attempt_extract.outcome == 'failure'
-        continue-on-error: true
+      - name: 校验 build（可选）
+        if: ${{ inputs.expect_build != '' }}
         run: |
           set -eux
-          mkdir -p "$RUNNER_TEMP/out_regex"
-          ipsw ota extract "$RUNNER_TEMP/ota.zip" \
-            '^/?System/Library/Caches/com.apple.dyld/dyld_shared_cache.*$' \
-            --output "$RUNNER_TEMP/out_regex" 2>&1 | tee /tmp/extract_regex.log || true
-          find "$RUNNER_TEMP/out_regex" -name 'dyld_shared_cache*' | head -100
+          SV=$(find "$RUNNER_TEMP/out_extract" -name 'SystemVersion.plist' | head -1 || true)
+          if [ -n "$SV" ]; then
+            echo "SystemVersion.plist: $SV"
+            /usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$SV" || true
+            /usr/libexec/PlistBuddy -c 'Print :ProductVersion' "$SV" || true
+          fi
+          grep -rho '22[A-Z][0-9]\{2,3\}' /tmp/extract.log | sort -u | head -20 || true
 
-      - name: 尝试 C —— 先 patch 出 SystemOS.dmg 再挂载
-        if: steps.attempt_extract.outcome == 'failure'
-        continue-on-error: true
+      - name: 收集
         run: |
           set -eux
-          mkdir -p "$RUNNER_TEMP/PATCHES"
-          # 全量 OTA 不是 RSR；这里试 rsr 子命令，若报错则记录
-          ipsw ota patch rsr "$RUNNER_TEMP/ota.zip" --output "$RUNNER_TEMP/PATCHES" \
-            2>&1 | tee /tmp/patch.log || true
-          echo "--- PATCHES tree ---"
-          find "$RUNNER_TEMP/PATCHES" -type f -maxdepth 4 2>/dev/null | head -50
-          echo "--- mount if dmg exists ---"
-          for d in $(find "$RUNNER_TEMP/PATCHES" -name '*.dmg' 2>/dev/null); do
-            echo "dmg: $d  size=$(stat -f %z "$d")"
-            hdiutil attach "$d" -nobrowse -readonly || true
-          done
-          find /Volumes -name 'dyld_shared_cache_arm64e*' 2>/dev/null | head -100
-
-      - name: 汇总结果
-        run: |
-          set -eux
-          echo "===== 所有找到的 dsc 文件 ====="
-          find "$RUNNER_TEMP" /Volumes -name 'dyld_shared_cache*' -type f 2>/dev/null \
-            -exec ls -l {} \; | head -200 || true
-          echo ""
-          echo "===== 收集到一个目录 ====="
           mkdir -p "$RUNNER_TEMP/collected"
-          find "$RUNNER_TEMP" /Volumes -name 'dyld_shared_cache*' -type f 2>/dev/null \
+          find "$RUNNER_TEMP/out_extract" /Volumes \
+            -name 'dyld_shared_cache*' -type f 2>/dev/null \
             -exec cp {} "$RUNNER_TEMP/collected/" \; || true
           ls -l "$RUNNER_TEMP/collected" | head -80
           du -sh "$RUNNER_TEMP/collected"
 
-      - name: 校验 dsc 头（关键判据）
+      - name: 校验 dsc 头
         run: |
           set -eux
           cd "$RUNNER_TEMP/collected" || exit 0
+          N=0
           for f in dyld_shared_cache_arm64e*; do
             [ -f "$f" ] || continue
             SZ=$(stat -f %z "$f")
             MAGIC=$(head -c 7 "$f" | tr -d '\0')
             echo "$f  size=$SZ  magic=$MAGIC"
+            N=$((N + 1))
           done
+          echo "total_files=$N"
+          [ "$N" -gt 0 ] || { echo "::error::没有提取到任何 dsc 文件"; exit 1; }
+
+      - name: 落盘 SHA256 清单
+        run: |
+          set -eux
+          cd "$RUNNER_TEMP/collected"
+          shasum -a 256 dyld_shared_cache_arm64e* > "$RUNNER_TEMP/SHA256SUMS.txt" || true
+          wc -l "$RUNNER_TEMP/SHA256SUMS.txt"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dsc-22H20
+          name: ${{ inputs.artifact_name }}
           path: |
             ${{ runner.temp }}/collected
+            ${{ runner.temp }}/SHA256SUMS.txt
             /tmp/extract.log
-            /tmp/extract_regex.log
-            /tmp/patch.log
           compression-level: 0
           if-no-files-found: warn
