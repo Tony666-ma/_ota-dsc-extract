@@ -67,12 +67,28 @@ jobs:
           sudo install -m 0755 "$RUNNER_TEMP/ipswbin/ipsw" /usr/local/bin/ipsw
           /usr/local/bin/ipsw version
 
-      - name: 下载镜像（Apple CDN）
+      - name: 下载镜像（Apple CDN，断点续传）
         run: |
           set -eux
-          curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/image.zip" "${{ inputs.source_url }}"
-          ls -lh "$RUNNER_TEMP/image.zip"
-          echo "bytes=$(stat -f %z "$RUNNER_TEMP/image.zip")"
+          OUT="$RUNNER_TEMP/image.zip"
+          # Apple CDN 会在大文件中途 RST（curl 56），必须 -C - 续传重试。
+          for i in $(seq 1 40); do
+            echo "=== attempt $i ==="
+            if curl -fL --retry 0 --connect-timeout 30 --max-time 1800 \
+                 -C - -o "$OUT" "${{ inputs.source_url }}"; then
+              echo "download OK"
+              break
+            fi
+            RC=$?
+            echo "curl rc=$RC, size=$(stat -f %z "$OUT" 2>/dev/null || echo 0)"
+            if [ "$RC" = "33" ]; then
+              echo "::error::服务器不支持 Range 续传"; exit 1
+            fi
+            sleep 10
+            if [ "$i" = "40" ]; then echo "::error::40 次重试仍失败"; exit 1; fi
+          done
+          ls -lh "$OUT"
+          echo "bytes=$(stat -f %z "$OUT")"
           df -h /
 
       - name: 解析 info（确认 build）
